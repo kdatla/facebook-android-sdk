@@ -62,11 +62,14 @@ public class Hackbook extends Activity  implements OnItemClickListener {
 
 	final int AUTHORIZE_ACTIVITY_RESULT_CODE = 0;
 	final int PICK_EXISTING_PHOTO_RESULT_CODE = 1;
+	
+	// If access token will expire in less than 10 days we will try to refresh it
+	final long REFRESH_TOKEN_BARRIER = 10L * 24L * 60L * 60L * 1000L;
 
     private String graph_or_fql;
     
     private ListView list;
-    String[] main_items = {"Update Status", "App Requests", "Get Friends", "Upload Photo", "Place Check-in", "Run FQL Query", "Graph API Explorer"};
+    String[] main_items = {"Update Status", "App Requests", "Get Friends", "Upload Photo", "Place Check-in", "Run FQL Query", "Graph API Explorer", "Token Refresh"};
     String[] permissions = {"offline_access", "publish_stream", "user_photos", "publish_checkins", "photo_upload"};
     
     /** Called when the activity is first created. */
@@ -116,9 +119,21 @@ public class Hackbook extends Activity  implements OnItemClickListener {
     @Override
     public void onResume() {
     	super.onResume();
-    	if(Utility.mFacebook != null && !Utility.mFacebook.isSessionValid()) {
-	    	mText.setText("You are logged out! ");
-	        mUserPic.setImageBitmap(null);
+    	if(Utility.mFacebook != null) {
+    	    if (!Utility.mFacebook.isSessionValid()) {
+    	        mText.setText("You are logged out! ");
+    	        mUserPic.setImageBitmap(null);
+    	    } else {
+    	        long tokenValidPeriod = Utility.mFacebook.getAccessExpires() -
+    	                System.currentTimeMillis();
+    	        // To avoid making unnecessary calls we refresh only the old tokens.
+    	        if (Utility.mFacebook.getAccessExpires() != 0L &&
+    	                tokenValidPeriod < REFRESH_TOKEN_BARRIER) {
+    	            // Try to refresh the access token - if the operation succeeds the life of
+    	            // the token will be extended automatically. See also the TokenRefreshDialog.
+    	            Utility.mFacebook.refreshToken(this, null);
+    	        }
+    	    }
     	}
     }
 
@@ -344,6 +359,15 @@ public class Hackbook extends Activity  implements OnItemClickListener {
     			startActivity(myIntent);
     			break;
     		}
+    		
+    		case 7: {
+                if(!Utility.mFacebook.isSessionValid()) {
+                    Util.showAlert(this, "Warning", "You must first log in.");
+                }
+                else {
+                    new TokenRefreshDialog(Hackbook.this).show();
+                }
+    		}
     	}
     }
     
@@ -472,7 +496,7 @@ public class Hackbook extends Activity  implements OnItemClickListener {
         }
 
     }
-    
+        
     /*
      * The Callback for notifying the application when authorization
      *  succeeds or fails.

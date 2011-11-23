@@ -22,15 +22,23 @@ import java.net.MalformedURLException;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Service;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ResolveInfo;
 import android.content.pm.Signature;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.RemoteException;
 import android.text.TextUtils;
 import android.util.Log;
 import android.webkit.CookieSyncManager;
@@ -93,7 +101,7 @@ public class Facebook {
         }
         mAppId = appId;
     }
-
+    
     /**
      * Default authorize method. Grants only basic permissions.
      *
@@ -288,7 +296,7 @@ public class Facebook {
      *            A list of permissions required for this application. If you do
      *            not require any permissions, pass an empty String array.
      */
-	private void startDialogAuth(Activity activity, String[] permissions) {
+    private void startDialogAuth(Activity activity, String[] permissions) {
         Bundle params = new Bundle();
         if (permissions.length > 0) {
             params.putString("scope", TextUtils.join(",", permissions));
@@ -370,7 +378,7 @@ public class Facebook {
                         if (description != null) {
                             error = error + ":" + description;
                         }
-                    	Log.d("Facebook-authorize", "Login failed: " + error);
+                        Log.d("Facebook-authorize", "Login failed: " + error);
                         mAuthDialogListener.onFacebookError(
                           new FacebookError(error));
                     }
@@ -412,6 +420,148 @@ public class Facebook {
             }
         }
     }
+    
+    /**
+     * Refresh OAuth access token method.
+     *
+     * Binds to Facebook for Android stand-alone application application to 
+     * refresh the access token.
+     *
+     * This method tries to connect to the Facebook App which will handle the
+     * authentication flow, and return a new OAuth access token. This method
+     * will automatically replace the old token with a new one.
+     *
+     * Note that this method is asynchronous and the callback will be invoked in
+     * the original calling thread (not in a background thread).
+     *
+     * Also note that requests may be made to the API without calling authorize
+     * first, in which case only public information is returned.
+     * 
+     * @param activity
+     *            The Android Activity that will be used to bind to the
+     *            Facebook RefreshToken Service
+     * @param serviceListener
+     *            Callback interface for notifying the calling application when
+     *            the refresh request has completed or failed (can be null). In
+     *            case of a success a new token can be found inside the result
+     *            Bundle under Facebook.ACCESS_TOKEN key.
+     * @return true if the binding to the RefreshToken Service was created
+     */
+    public boolean refreshToken(final Activity activity, final ServiceListener serviceListener) {
+        Intent intent = new Intent();
+
+        intent.setClassName("com.facebook.katana",
+                "com.facebook.katana.platform.TokenRefreshService");
+         
+        // Verify that the application whose package name is
+        // com.facebook.katana
+        // has the expected FB app signature.
+        if (!validateAppSignatureForIntent(activity, intent)) {
+            return false;
+        }
+        
+        mAuthActivity = activity;
+        
+        return activity.bindService(intent,
+                new TokenRefreshServiceConnection(serviceListener),
+                Service.BIND_AUTO_CREATE);
+    }
+    
+    /**
+     * Handles connection to the token refresh service.
+     * 
+     */
+    private class TokenRefreshServiceConnection implements ServiceConnection {
+        
+        final Messenger messageReceiver = new Messenger(new Handler() {
+            @Override
+            public void handleMessage(Message msg) {
+                String token = msg.getData().getString(TOKEN);
+                long expiresAt = msg.getData().getLong(EXPIRES) * 1000;
+                
+                // To avoid confusion we should return the expiration time in
+                // the same format as the getAccessExpires() function - that
+                // is in milliseconds.
+                Bundle resBundle = (Bundle)msg.getData().clone();
+                resBundle.putLong(EXPIRES, expiresAt);
+
+                if (token != null) {
+                    mAccessToken = token;
+                    mAccessExpires = expiresAt;
+                    serviceListener.onComplete(resBundle);
+                } else {
+                    String error = msg.getData().getString("error");
+                    int errorCode = msg.getData().getInt("error_code", -1);
+                    
+                    if (errorCode != -1) {
+                        serviceListener.onFacebookError(
+                                new FacebookError(error, null, errorCode));
+                    } else {
+                        serviceListener.onError(new Error(
+                                error != null ? error : "Unknown service error"));
+                    }
+                }
+                
+                // The refreshToken function should be called rarely,
+                // so there is no point in keeping the binding open.
+                mAuthActivity.unbindService(
+                        TokenRefreshServiceConnection.this);
+            }
+        });
+        
+        final ServiceListener serviceListener;
+        
+        Messenger messageSender = null;
+        
+        public TokenRefreshServiceConnection(ServiceListener serviceListener) {
+            if (serviceListener == null) {
+                // When user don't want to be notified about the results
+                // of this operation we create an empty callback just to
+                // avoid NullPointerExceptions.
+                serviceListener = new ServiceListener() {
+                    @Override
+                    public void onFacebookError(FacebookError e) {}
+                    @Override
+                    public void onError(Error e) {}
+                    @Override
+                    public void onComplete(Bundle values) {}
+                };
+            }
+            this.serviceListener = serviceListener;
+        }
+        
+        @Override
+        public void onServiceConnected(ComponentName className,
+                IBinder service) {
+            messageSender = new Messenger(service);
+            refreshToken();
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName arg) {
+            serviceListener.onError(
+                    new Error("Service disconnected"));
+            // We returned an error so there's no point in
+            // keeping the binding open.
+            mAuthActivity.unbindService(TokenRefreshServiceConnection.this);
+        }
+        
+        private void refreshToken() {
+            Bundle requestData = new Bundle();
+            requestData.putString(TOKEN, mAccessToken);
+            
+            Message request = Message.obtain();
+            request.setData(requestData);
+            request.replyTo = messageReceiver;
+            
+            try {
+                messageSender.send(request);
+            } catch (RemoteException e) {
+                serviceListener.onError(
+                        new Error("Service connection error"));
+            }
+        }       
+    };
 
     /**
      * Invalidate the current user session by removing the access token in
@@ -686,7 +836,7 @@ public class Facebook {
     public void setAccessExpiresIn(String expiresIn) {
         if (expiresIn != null && !expiresIn.equals("0")) {
             setAccessExpires(System.currentTimeMillis()
-                    + Integer.parseInt(expiresIn) * 1000);
+                    + Integer.parseInt(expiresIn) * 1000L);
         }
     }
 
@@ -739,7 +889,37 @@ public class Facebook {
         public void onCancel();
 
     }
+    
+    /**
+     * Callback interface for service requests.
+     *
+     */
+    public static interface ServiceListener {
 
+        /**
+         * Called when a service request completes.
+         *
+         * @param values
+         *            Key-value string pairs extracted from the response.
+         */
+        public void onComplete(Bundle values);
+
+        /**
+         * Called when a Facebook server responds to the 
+         * request with an error.
+         *
+         */
+        public void onFacebookError(FacebookError e);
+        
+        /**
+         * Called when a Facebook Service responds to the 
+         * request with an error.
+         *
+         */
+        public void onError(Error e);
+
+    }
+    
     public static final String FB_APP_SIGNATURE =
         "30820268308201d102044a9c4610300d06092a864886f70d0101040500307a310"
         + "b3009060355040613025553310b30090603550408130243413112301006035504"
